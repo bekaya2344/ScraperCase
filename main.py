@@ -2,6 +2,7 @@ import os
 import re
 import time
 import hashlib
+import json
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from io import BytesIO
@@ -204,13 +205,10 @@ def save_rec(n, rec):
     if len(base) > maxlen:
         h = hashlib.md5((rec.get("kaynak_url", "") + rec.get("baslik", "")).encode("utf-8")).hexdigest()[:8]
         base = f"{base[:maxlen]}_{h}"
-    fn = base + ".txt"
+    fn = base + ".json"
     p = os.path.join(OUT_DIR, fn)
     with open(p, "w", encoding="utf-8") as f:
-        f.write(
-            f"Tarih: {rec['tarih']}\nSayı No: {rec['sayi']}\nKategori: {rec['kategori']}\nBaşlık: {rec['baslik']}\nKarar/Kanun No: {rec['karar_kanun_no'] or '-'}\nKaynak URL: {rec['kaynak_url']}\n")
-        f.write("-" * 70 + "\n")
-        f.write(rec["metin"] + "\n")
+        json.dump(rec, f, ensure_ascii=False, indent=2)
     return p
 
 
@@ -224,15 +222,138 @@ def _normalize_ws(text: str) -> str:
 
 
 def _strip_headers_footers(text: str) -> str:
-    lines, out = (text or "").splitlines(), []
+    lines = text.splitlines()
+    out = []
+
     for ln in lines:
         s = ln.strip()
-        if re.search(r"Resm[iî]\s*Gazete", s, flags=re.I) and (
-                re.search(r"Say[ıi]\s*:", s, flags=re.I) or re.match(r"\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{4}", s)):
+
+        if re.match(r"\d{1,2} [A-Za-zÇĞİÖŞÜçğıöşü]+ \d{4}(,|\s)?(PAZAR|PAZARTESİ|SALI|ÇARŞAMBA|PERŞEMBE|CUMA|CUMARTESİ)?", s, re.I):
             continue
-        if re.match(r"[-—–]\s*\d+\s*[-—–]$", s): continue
+
+        if "resmî gazete" in s.lower():
+            continue
+
+        if re.match(r"Sayı\s*:\s*\d{5}", s):
+            continue
+
+        if s.isupper() and len(s) < 20 and s in ["YÖNETMELİK", "TEBLİĞ", "KURUL KARARI", "GENELGE", "İLAN"]:
+            continue
+
         out.append(ln)
-    return "\n".join(out)
+
+    return "\n".join(out).strip()
+def _strip_header_lines(text: str) -> str:
+
+    lines = text.splitlines()
+    cleaned = []
+    skip_patterns = [
+        r"^\s*\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{4}(?:\s+[PAZARTESİ|SALI|ÇARŞAMBA|PERŞEMBE|CUMA|CUMARTESİ|PAZAR]*)?$",
+        r"^\s*Resm[iî] Gazete\s*$",
+        r"^\s*Sayı\s*:\s*\d+",
+        r"^\s*Karar\s*No\s*:?\s*\d+",
+        r"^\s*Karar\s*Tarihi\s*:?\s*\d{1,2}/\d{1,2}/\d{4}",
+        r"^\s*\(.*?\)$",
+    ]
+    for ln in lines:
+        if any(re.match(pat, ln.strip(), flags=re.IGNORECASE) for pat in skip_patterns):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
+
+def extract_title_from_text(text: str) -> str:
+    lines = text.splitlines()
+    candidates = []
+
+    for i, line in enumerate(lines[:30]):
+        s = line.strip()
+        if len(s) > 30 and s.isupper() and not s.lower().startswith("resmî gazete"):
+            candidates.append(s)
+
+        elif (
+            40 < len(s) < 150
+            and sum(1 for c in s if c.isupper()) > len(s) * 0.6
+            and not re.match(r"\d{1,2} [A-Za-zÇĞİÖŞÜçğıöşü]+ \d{4}", s)
+        ):
+            candidates.append(s)
+
+    if candidates:
+        return max(candidates, key=len)
+
+    return lines[0].strip() if lines else ""
+
+def save_rec_with_pdf_and_images(n, rec, pdf_bytes=None, page_images=None):
+    folder_name = f"{rec['tarih'].replace('.', '')}_{rec['sayi']}_{sanitize(rec['kategori']).upper()}_{n:03d}"
+    record_dir = os.path.join(OUT_DIR, folder_name)
+    os.makedirs(record_dir, exist_ok=True)
+
+    # PDF dosyasını kaydet
+    pdf_filename = None
+    if pdf_bytes:
+        pdf_filename = "kaynak.pdf"
+        pdf_path = os.path.join(record_dir, pdf_filename)
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+
+    # Sayfa görsellerini kaydet
+    image_paths = []
+    if page_images:
+        pages_dir = os.path.join(record_dir, "pages")
+        os.makedirs(pages_dir, exist_ok=True)
+        for i, img in enumerate(page_images, start=1):
+            img_filename = f"page_{i}.png"
+            img_path = os.path.join(pages_dir, img_filename)
+            img.save(img_path)
+            image_paths.append(os.path.relpath(img_path, record_dir))
+
+    rec["pdf_dosyasi"] = pdf_filename if pdf_filename else ""
+    rec["sayfa_resimleri"] = image_paths
+
+    json_path = os.path.join(record_dir, "data.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False, indent=2)
+
+    return json_path
+
+def pdf_to_text_robust_with_images(pdf_bytes: bytes):
+    text_pieces, images, used_ocr = [], [], 0
+    if PYMUPDF_OK and PIL_OK:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for pg in doc:
+                txt = (pg.get_text("text") or "").strip()
+                if len(txt) < 200:
+                    ocr_txt = _ocr_page_with_tesseract(pg)
+                    if len(ocr_txt.strip()) > len(txt):
+                        txt = ocr_txt
+                        used_ocr += 1
+                text_pieces.append(txt)
+
+                pix = pg.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+            doc.close()
+        except Exception:
+            text_pieces, images = [], []
+
+    text = "\n".join(text_pieces).strip()
+
+    if len(text) < 200:
+        try:
+            params1 = LAParams(char_margin=2.0, line_margin=0.6, word_margin=0.10, boxes_flow=0.5)
+            params2 = LAParams(char_margin=2.5, line_margin=0.3, word_margin=0.05, boxes_flow=None)
+            t1 = pdf_extract_text(BytesIO(pdf_bytes), laparams=params1) or ""
+            t2 = pdf_extract_text(BytesIO(pdf_bytes), laparams=params2) or ""
+            text = t2 if len(t2) > len(t1) else t1
+        except Exception:
+            pass
+
+    text = _normalize_ws(text)
+    text = _dehyphenate(text)
+    text = _strip_headers_footers(text)
+    text = _strip_appendix_parts(text)
+
+    return text.strip(), images
 
 
 def _dehyphenate(text: str) -> str:
@@ -287,6 +408,7 @@ def pdf_to_text_robust(pdf_bytes: bytes) -> str:
     base = _dehyphenate(base)
     base = _strip_headers_footers(base)
     base = _strip_appendix_parts(base)
+    base = _strip_header_lines(base)
     return base.strip()
 
 def _cut_after_appendix_markers(text: str, min_keep_chars: int = 400) -> str:
@@ -392,45 +514,42 @@ def format_table_as_text(table_data: list[dict]) -> str:
 
 
 
-def parse_detail(item: dict, date_str: str) -> dict | None:
+def parse_detail(item: dict, date_str: str, seq_num: int) -> dict | None:
     url = item["url"]
     try:
         resp = SESSION.get(url, timeout=40)
-        if resp.status_code != 200: return None
+        if resp.status_code != 200:
+            return None
     except requests.RequestException:
         return None
 
     content_type = (resp.headers.get("Content-Type") or "").lower()
     title = item.get("title_from_list", "").strip()
     text = ""
+    pdf_bytes, images = None, []
 
     if url.lower().endswith(".pdf") or "pdf" in content_type:
-        raw_text = pdf_to_text_robust(resp.content)
+        pdf_bytes = resp.content
+        text, images = pdf_to_text_robust_with_images(pdf_bytes)
 
-
-        if "CUMHURBAŞKANI KARARININ EKİ" in raw_text or "LİSTE" in raw_text:
-            table_data = parse_table_from_ocr_text(raw_text)
-
+        if "CUMHURBAŞKANI KARARININ EKİ" in text or "LİSTE" in text:
+            table_data = parse_table_from_ocr_text(text)
             if table_data:
                 header_part = ""
-                if "LİSTE" in raw_text:
-                    header_part = raw_text.split("LİSTE")[0] + "LİSTE\n"
-                elif "CUMHURBAŞKANI KARARININ EKİ" in raw_text:
-                    parts = raw_text.split("CUMHURBAŞKANI KARARININ EKİ")
+                if "LİSTE" in text:
+                    header_part = text.split("LİSTE")[0] + "LİSTE\n"
+                elif "CUMHURBAŞKANI KARARININ EKİ" in text:
+                    parts = text.split("CUMHURBAŞKANI KARARININ EKİ")
                     header_part = parts[0] + "CUMHURBAŞKANI KARARININ EKİ\n"
 
                 formatted_table = format_table_as_text(table_data)
                 text = header_part + "\n" + formatted_table
-            else:
-                text = raw_text
-        else:
-            text = raw_text
     else:
-        # HTML işleme
         soup = BeautifulSoup(resp.content, "lxml")
         try:
             t = extract_title(soup)
-            if t: title = t
+            if t:
+                title = t
         except Exception:
             pass
         text = _normalize_ws(clean_text(soup))
@@ -438,7 +557,10 @@ def parse_detail(item: dict, date_str: str) -> dict | None:
     karar_kanun_no = extract_no(text)
     tarih = item.get("date_from_header") or date_str
 
-    return {
+    if not title or title.lower() == "resmî gazete":
+        title = extract_title_from_text(text)
+
+    rec = {
         "tarih": tarih,
         "sayi": item.get("issue") or "NA",
         "kategori": item["category"],
@@ -447,6 +569,10 @@ def parse_detail(item: dict, date_str: str) -> dict | None:
         "kaynak_url": url,
         "metin": (text or "").strip(),
     }
+
+    # JSON + dosya yapısı
+    save_rec_with_pdf_and_images(seq_num, rec, pdf_bytes=pdf_bytes, page_images=images)
+    return rec
 
 
 
@@ -473,10 +599,9 @@ def main():
         seq = 1
         for it in items:
             it["issue"] = issue
-            rec = parse_detail(it, ds)
+            rec = parse_detail(it, ds, seq)
             if rec:
-                path = save_rec(seq, rec)
-                print("   ->", os.path.basename(path))
+                print(f"   -> {rec.get('klasor_adi', '[kaydedildi]')}")
                 seq += 1
             time.sleep(0.4)
 
