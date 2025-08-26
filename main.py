@@ -10,6 +10,8 @@ from io import BytesIO
 import requests
 from bs4 import BeautifulSoup
 from dateutil import tz
+from models import ResmiGazeteKaydi
+
 
 from pdfminer.high_level import extract_text as pdf_extract_text, extract_pages
 from pdfminer.layout import LAParams, LTTextContainer
@@ -208,7 +210,7 @@ def save_rec(n, rec):
     fn = base + ".json"
     p = os.path.join(OUT_DIR, fn)
     with open(p, "w", encoding="utf-8") as f:
-        json.dump(rec, f, ensure_ascii=False, indent=2)
+        json.dump(rec.model_dump(mode="json"), f, ensure_ascii=False, indent=2)
     return p
 
 
@@ -283,7 +285,7 @@ def extract_title_from_text(text: str) -> str:
     return lines[0].strip() if lines else ""
 
 def save_rec_with_pdf_and_images(n, rec, pdf_bytes=None, page_images=None):
-    folder_name = f"{rec['tarih'].replace('.', '')}_{rec['sayi']}_{sanitize(rec['kategori']).upper()}_{n:03d}"
+    folder_name = f"{rec.tarih.replace('.', '')}_{rec.sayi}_{sanitize(rec.kategori).upper()}_{n:03d}"
     record_dir = os.path.join(OUT_DIR, folder_name)
     os.makedirs(record_dir, exist_ok=True)
 
@@ -306,12 +308,12 @@ def save_rec_with_pdf_and_images(n, rec, pdf_bytes=None, page_images=None):
             img.save(img_path)
             image_paths.append(os.path.relpath(img_path, record_dir))
 
-    rec["pdf_dosyasi"] = pdf_filename if pdf_filename else ""
-    rec["sayfa_resimleri"] = image_paths
+    rec.pdf_dosyasi = pdf_filename if pdf_filename else ""
+    rec.sayfa_resimleri = image_paths
 
     json_path = os.path.join(record_dir, "data.json")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rec, f, ensure_ascii=False, indent=2)
+        json.dump(rec.model_dump(mode="json"), f, ensure_ascii=False, indent=2)
 
     return json_path
 
@@ -514,7 +516,7 @@ def format_table_as_text(table_data: list[dict]) -> str:
 
 
 
-def parse_detail(item: dict, date_str: str, seq_num: int) -> dict | None:
+def parse_detail(item: dict, date_str: str, seq_num: int) -> ResmiGazeteKaydi | None:
     url = item["url"]
     try:
         resp = SESSION.get(url, timeout=40)
@@ -560,18 +562,19 @@ def parse_detail(item: dict, date_str: str, seq_num: int) -> dict | None:
     if not title or title.lower() == "resmî gazete":
         title = extract_title_from_text(text)
 
-    rec = {
-        "tarih": tarih,
-        "sayi": item.get("issue") or "NA",
-        "kategori": item["category"],
-        "baslik": title,
-        "karar_kanun_no": karar_kanun_no or "",
-        "kaynak_url": url,
-        "metin": (text or "").strip(),
-    }
+    # Pydantic model nesnesi oluştur
+    rec = ResmiGazeteKaydi(
+        tarih=tarih,
+        sayi=item.get("issue") or "NA",
+        kategori=item["category"],
+        baslik=title,
+        karar_kanun_no=karar_kanun_no or "",
+        kaynak_url=url,
+        metin=(text or "").strip(),
+    )
 
-    # JSON + dosya yapısı
     save_rec_with_pdf_and_images(seq_num, rec, pdf_bytes=pdf_bytes, page_images=images)
+
     return rec
 
 
@@ -601,7 +604,7 @@ def main():
             it["issue"] = issue
             rec = parse_detail(it, ds, seq)
             if rec:
-                print(f"   -> {rec.get('klasor_adi', '[kaydedildi]')}")
+                print(f"   -> {rec.baslik[:60]}... [kaydedildi]")
                 seq += 1
             time.sleep(0.4)
 
